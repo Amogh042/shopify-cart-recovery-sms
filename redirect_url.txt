@@ -1,0 +1,2 @@
+Status: 302
+Location: https://mytest.myshopify.com/admin/oauth/authorize?client_id=42f37f298c03e9fb9e502c441514125d&scope=read_customers%2Cwrite_orders%2Cwrite_checkouts&redirect_uri=https%3A%2F%2Flocalhost%3A3000%2Fauth%2Fcallback&state=538567712352002&grant_options%5B%5D=
