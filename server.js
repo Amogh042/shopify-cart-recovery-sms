@@ -9,9 +9,6 @@ const { startScheduler } = require('./sms-scheduler');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
 app.use(
   session({
     name: 'shopify_plugin_sid',
@@ -67,46 +64,15 @@ function verifyShopifyWebhook(req, res, next) {
 
 // ─── Health check ───
 app.get('/', (req, res) => {
-  // When launched from Shopify Admin, the app is opened with ?shop=... (and sometimes &host=...).
-  // Redirecting to /dashboard gives a friendly UI instead of raw JSON.
-  if (req.query.shop) {
-    return res.redirect(`/dashboard?shop=${encodeURIComponent(String(req.query.shop))}`);
+  const shop = req.query.shop;
+
+  // Shopify Admin opens the app with `/?shop=store.myshopify.com` (and sometimes `&host=...`).
+  // Route Shopify into OAuth so a session can be established.
+  if (shop) {
+    return res.redirect(`/auth?shop=${encodeURIComponent(String(shop))}`);
   }
 
-  res
-    .status(200)
-    .type('html')
-    .send(
-      `<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CartRecovery SMS</title>
-    <style>
-      body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#fff;color:#0f172a;margin:0}
-      .header{background:#0b5cff;color:#fff;padding:18px 22px}
-      .wrap{max-width:1100px;margin:0 auto;padding:22px}
-      a{color:#0b5cff}
-      .card{border:1px solid #e2e8f0;border-radius:14px;padding:14px 16px;background:#fff}
-      code{background:#eef2ff;padding:2px 6px;border-radius:6px}
-    </style>
-  </head>
-  <body>
-    <div class="header">
-      <div style="max-width:1100px;margin:0 auto">
-        <div style="font-weight:900;font-size:18px">CartRecovery SMS</div>
-      </div>
-    </div>
-    <div class="wrap">
-      <div class="card">
-        <div style="font-weight:800;margin-bottom:6px">Server is running</div>
-        <div>Open <code>/dashboard?shop=&lt;yourstore.myshopify.com&gt;</code> or start OAuth at <code>/auth?shop=&lt;yourstore.myshopify.com&gt;</code>.</div>
-      </div>
-    </div>
-  </body>
-</html>`
-    );
+  return res.status(200).type('text').send('No shop provided');
 });
 
 // ─── OAuth: Begin ───
