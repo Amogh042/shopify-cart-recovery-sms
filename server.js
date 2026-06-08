@@ -24,7 +24,8 @@ app.use(
   })
 );
 
-// ─── Raw body for webhooks ───
+// ─── Raw body for Shopify webhooks, form-encoded for Twilio inbound ───
+app.use('/webhooks/twilio', express.urlencoded({ extended: false }));
 app.use('/webhooks', express.raw({ type: 'application/json' }));
 app.use((req, res, next) => {
   if (!req.path.startsWith('/webhooks')) {
@@ -109,10 +110,11 @@ app.get('/auth/callback', async (req, res) => {
 
     req.session.shop_domain = shop;
 
-    // ✅ Save shop
+    // ✅ Save shop (re-activate on reinstall)
     await supabase.from('shops').upsert({
       shop_domain: shop,
       access_token: accessToken,
+      is_active: true,
     });
 
     // 🔥 REGISTER WEBHOOKS (CRITICAL)
@@ -151,7 +153,48 @@ app.get('/auth/callback', async (req, res) => {
         }),
       });
 
-      console.log('✅ Webhooks registered (carts/update + orders/create)');
+      // Register app/uninstalled webhook
+      await fetch(`https://${shop}/admin/api/2024-01/webhooks.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': accessToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          webhook: {
+            topic: 'app/uninstalled',
+            address:
+              'https://shopify-cart-recovery-sms.onrender.com/webhooks/app/uninstalled',
+            format: 'json',
+          },
+        }),
+      });
+
+      // Register GDPR webhooks
+      const gdprTopics = [
+        { topic: 'customers/data_request', path: '/webhooks/gdpr/customers-data-request' },
+        { topic: 'customers/redact', path: '/webhooks/gdpr/customers-redact' },
+        { topic: 'shop/redact', path: '/webhooks/gdpr/shop-redact' },
+      ];
+
+      for (const { topic, path } of gdprTopics) {
+        await fetch(`https://${shop}/admin/api/2024-01/webhooks.json`, {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': accessToken,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            webhook: {
+              topic,
+              address: `https://shopify-cart-recovery-sms.onrender.com${path}`,
+              format: 'json',
+            },
+          }),
+        });
+      }
+
+      console.log('✅ Webhooks registered (carts/update, orders/create, app/uninstalled, GDPR x3)');
     } catch (err) {
       console.error('Webhook error:', err.message);
     }
@@ -260,6 +303,116 @@ app.post(
       console.error('❌ Unexpected error in order webhook:', error.message);
       res.status(500).send('Server error');
     }
+  }
+);
+
+// ─── Twilio Inbound SMS (opt-out handling) ───
+app.post('/webhooks/twilio/inbound', async (req, res) => {
+  const from = req.body.From;
+  const body = (req.body.Body || '').trim().toUpperCase();
+
+  if (!from) return res.status(200).type('text/xml').send('<Response/>');
+
+  const optOutKeywords = ['STOP', 'UNSUBSCRIBE', 'CANCEL', 'QUIT', 'END'];
+
+  if (optOutKeywords.includes(body)) {
+    console.log(`🚫 Opt-out received from ${from}`);
+
+    const { error } = await supabase
+      .from('sms_optouts')
+      .upsert({ phone_number: from, opted_out_at: new Date().toISOString() }, { onConflict: 'phone_number' });
+
+    if (error) {
+      console.error(`❌ Failed to save opt-out for ${from}: ${error.message}`);
+    }
+  }
+
+  res.status(200).type('text/xml').send('<Response/>');
+});
+
+// ─── App Uninstalled Webhook ───
+app.post(
+  '/webhooks/app/uninstalled',
+  verifyShopifyWebhook,
+  async (req, res) => {
+    const shopDomain = req.get('X-Shopify-Shop-Domain');
+    console.log(`🗑️ App uninstalled by ${shopDomain}`);
+
+    const { error } = await supabase
+      .from('shops')
+      .update({ is_active: false })
+      .eq('shop_domain', shopDomain);
+
+    if (error) {
+      console.error(`❌ Failed to deactivate shop ${shopDomain}: ${error.message}`);
+    }
+
+    res.status(200).send('ok');
+  }
+);
+
+// ─── GDPR Webhooks ───
+app.post(
+  '/webhooks/gdpr/customers-data-request',
+  verifyShopifyWebhook,
+  async (req, res) => {
+    const payload = req.body;
+    console.log(`📋 GDPR data request received for shop ${payload.shop_domain}`, JSON.stringify(payload));
+    res.status(200).send('ok');
+  }
+);
+
+app.post(
+  '/webhooks/gdpr/customers-redact',
+  verifyShopifyWebhook,
+  async (req, res) => {
+    const payload = req.body;
+    const phone = payload.customer?.phone;
+    const shopDomain = payload.shop_domain;
+
+    console.log(`🧹 GDPR customer redact for ${phone} at ${shopDomain}`);
+
+    if (phone) {
+      const { data: carts } = await supabase
+        .from('abandoned_carts')
+        .select('id')
+        .eq('shop_domain', shopDomain)
+        .eq('customer_phone', phone);
+
+      if (carts && carts.length > 0) {
+        const cartIds = carts.map((c) => c.id);
+        await supabase.from('sms_logs').delete().in('cart_id', cartIds);
+        await supabase.from('abandoned_carts').delete().in('id', cartIds);
+      }
+
+      await supabase.from('sms_optouts').delete().eq('phone_number', phone);
+    }
+
+    res.status(200).send('ok');
+  }
+);
+
+app.post(
+  '/webhooks/gdpr/shop-redact',
+  verifyShopifyWebhook,
+  async (req, res) => {
+    const shopDomain = req.body.shop_domain;
+    console.log(`🧹 GDPR shop redact for ${shopDomain}`);
+
+    const { data: carts } = await supabase
+      .from('abandoned_carts')
+      .select('id')
+      .eq('shop_domain', shopDomain);
+
+    if (carts && carts.length > 0) {
+      const cartIds = carts.map((c) => c.id);
+      await supabase.from('sms_logs').delete().in('cart_id', cartIds);
+    }
+
+    await supabase.from('abandoned_carts').delete().eq('shop_domain', shopDomain);
+    await supabase.from('shops').delete().eq('shop_domain', shopDomain);
+
+    res.status(200).send('ok');
   }
 );
 

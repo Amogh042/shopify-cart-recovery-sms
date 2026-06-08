@@ -149,11 +149,17 @@ async function sendAbandonedCartSMS() {
       return;
     }
 
+    // Load opt-out list once per run
+    const { data: optouts } = await supabase
+      .from('sms_optouts')
+      .select('phone_number');
+    const optedOutPhones = new Set((optouts || []).map((r) => r.phone_number));
+
     // Process first SMS (1 hour)
     const { data: firstCarts, error: firstError } = await supabase
       .from('abandoned_carts')
       .select(`*
-        , shops!inner(is_paid)
+        , shops!inner(is_paid, is_active)
       `)
       .eq('sms_sent', false)
       .lt('abandoned_at', oneHourAgo);
@@ -163,15 +169,21 @@ async function sendAbandonedCartSMS() {
     } else if (firstCarts && firstCarts.length > 0) {
       console.log(`   📦 Found ${firstCarts.length} cart(s) for 1st SMS`);
       for (const cart of firstCarts) {
-        // Check if shop is paid
+        if (!cart.shops?.is_active) {
+          console.log(`   🔌 Inactive shop - SMS blocked for ${cart.shop_domain}`);
+          continue;
+        }
         if (!cart.shops?.is_paid) {
           console.log(`   💰 Unpaid shop - SMS blocked for ${cart.shop_domain}`);
           continue;
         }
-
         if (!cart.customer_phone) {
           console.log(`   ⏭️  Skipping cart ${cart.id} — no phone number`);
-          // Mark as processed to avoid infinite loop
+          await supabase.from('abandoned_carts').update({ sms_sent: true }).eq('id', cart.id);
+          continue;
+        }
+        if (optedOutPhones.has(cart.customer_phone)) {
+          console.log(`   🚫 Opted-out phone ${cart.customer_phone} — skipping cart ${cart.id}`);
           await supabase.from('abandoned_carts').update({ sms_sent: true }).eq('id', cart.id);
           continue;
         }
@@ -183,7 +195,7 @@ async function sendAbandonedCartSMS() {
     const { data: secondCarts, error: secondError } = await supabase
       .from('abandoned_carts')
       .select(`*
-        , shops!inner(is_paid)
+        , shops!inner(is_paid, is_active)
       `)
       .eq('sms_sent', true)
       .eq('second_sms_sent', false)
@@ -195,14 +207,20 @@ async function sendAbandonedCartSMS() {
     } else if (secondCarts && secondCarts.length > 0) {
       console.log(`   📦 Found ${secondCarts.length} cart(s) for 2nd SMS`);
       for (const cart of secondCarts) {
-        // Check if shop is paid
+        if (!cart.shops?.is_active) {
+          console.log(`   🔌 Inactive shop - SMS blocked for ${cart.shop_domain}`);
+          continue;
+        }
         if (!cart.shops?.is_paid) {
           console.log(`   💰 Unpaid shop - SMS blocked for ${cart.shop_domain}`);
           continue;
         }
-
         if (!cart.customer_phone) {
           console.log(`   ⏭️  Skipping cart ${cart.id} — no phone number`);
+          continue;
+        }
+        if (optedOutPhones.has(cart.customer_phone)) {
+          console.log(`   🚫 Opted-out phone ${cart.customer_phone} — skipping cart ${cart.id}`);
           continue;
         }
         await processSecondSMS(cart);
