@@ -84,9 +84,7 @@ async function processSecondSMS(cart) {
   const checkoutUrl = cart.checkout_url || '';
 
   const message =
-    `Hey ${customerName}, still thinking about ${productNames}?\n` +
-    `Here is a 10% discount for you: use code COMEBACK10 at checkout:\n` +
-    `${checkoutUrl} — Reply STOP to opt out`;
+    `Hi ${customerName}, use code COMEBACK10 for 10% off your cart: ${checkoutUrl} Reply STOP to opt out`;
 
   console.log(`   📱 Sending 2nd SMS to ${cart.customer_phone}...`);
 
