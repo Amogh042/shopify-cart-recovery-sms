@@ -67,9 +67,25 @@ app.get('/', (req, res) => {
 // ─── Auth ───
 app.get('/auth', async (req, res) => {
   const shop = req.query.shop;
+  const error = req.query.error;
+  const message = req.query.message;
+
+  // If there's an error but no shop, show error message
+  if (error && !shop) {
+    return res.status(400).send(`
+      <h2>Authentication Error</h2>
+      <p>${message || 'Unknown error occurred'}</p>
+      <p>Please access the app through Shopify admin or provide a shop parameter.</p>
+      <a href="/">Go back</a>
+    `);
+  }
 
   if (!shop) {
-    return res.status(400).json({ error: 'Missing shop param' });
+    return res.status(400).send(`
+      <h2>Missing Shop Parameter</h2>
+      <p>Please access the app through Shopify admin or provide a shop parameter.</p>
+      <a href="/">Go back</a>
+    `);
   }
 
   await shopify.auth.begin({
@@ -99,8 +115,9 @@ app.get('/auth/callback', async (req, res) => {
       access_token: accessToken,
     });
 
-    // 🔥 REGISTER WEBHOOK (CRITICAL)
+    // 🔥 REGISTER WEBHOOKS (CRITICAL)
     try {
+      // Register carts/update webhook
       await fetch(`https://${shop}/admin/api/2024-01/webhooks.json`, {
         method: 'POST',
         headers: {
@@ -117,7 +134,24 @@ app.get('/auth/callback', async (req, res) => {
         }),
       });
 
-      console.log('✅ Webhook registered');
+      // Register orders/create webhook for recovery tracking
+      await fetch(`https://${shop}/admin/api/2024-01/webhooks.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': accessToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          webhook: {
+            topic: 'orders/create',
+            address:
+              'https://shopify-cart-recovery-sms.onrender.com/webhooks/orders/create',
+            format: 'json',
+          },
+        }),
+      });
+
+      console.log('✅ Webhooks registered (carts/update + orders/create)');
     } catch (err) {
       console.error('Webhook error:', err.message);
     }
@@ -139,31 +173,279 @@ app.post(
     const phone = cart.phone || cart.customer?.phone;
     if (!phone) return res.status(200).send('No phone');
 
-    await supabase.from('abandoned_carts').insert({
-      shop_domain: shopDomain,
-      cart_token: cart.token,
-      customer_phone: phone,
-      cart_total: cart.total_price,
-      product_names: (cart.line_items || [])
-        .map((i) => i.title)
-        .join(', '),
-      checkout_url: cart.checkout_url,
-      abandoned_at: new Date().toISOString(),
-    });
+    await supabase.from('abandoned_carts').upsert(
+      {
+        shop_domain: shopDomain,
+        cart_token: cart.token,
+        customer_phone: phone,
+        cart_total: cart.total_price,
+        product_names: (cart.line_items || [])
+          .map((i) => i.title)
+          .join(', '),
+        checkout_url: cart.checkout_url,
+        abandoned_at: new Date().toISOString(),
+      },
+      { onConflict: 'shop_domain,cart_token' }
+    );
 
     res.status(200).send('ok');
   }
 );
 
+// ─── Orders Webhook (Recovery Tracking) ───
+app.post(
+  '/webhooks/orders/create',
+  verifyShopifyWebhook,
+  async (req, res) => {
+    const order = req.body;
+    const shopDomain = req.get('X-Shopify-Shop-Domain');
+
+    // Extract customer phone number from order
+    const phone = order.phone || order.customer?.phone;
+    if (!phone) {
+      console.log('📞 No phone number in order, skipping recovery check');
+      return res.status(200).send('No phone');
+    }
+
+    console.log(`🛒 New order received from ${phone} at ${shopDomain}`);
+
+    try {
+      // Look for abandoned carts matching criteria
+      const fortyEightHoursAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      
+      const { data: carts, error } = await supabase
+        .from('abandoned_carts')
+        .select('*')
+        .eq('shop_domain', shopDomain)
+        .eq('customer_phone', phone)
+        .eq('sms_sent', true)
+        .eq('recovered', false)
+        .gte('abandoned_at', fortyEightHoursAgo)
+        .order('abandoned_at', { ascending: false })
+        .limit(1);
+
+      if (error) {
+        console.error('❌ Error querying abandoned carts:', error.message);
+        return res.status(500).send('Database error');
+      }
+
+      if (!carts || carts.length === 0) {
+        console.log(`📭 No matching abandoned cart found for ${phone}`);
+        return res.status(200).send('No matching cart');
+      }
+
+      // Found matching cart - mark as recovered
+      const cart = carts[0];
+      console.log(`✅ Found matching cart ${cart.id}, marking as recovered`);
+
+      const { error: updateError } = await supabase
+        .from('abandoned_carts')
+        .update({
+          recovered: true,
+          recovered_at: new Date().toISOString(),
+          order_id: order.id.toString(),
+          recovery_order_total: order.total_price
+        })
+        .eq('id', cart.id);
+
+      if (updateError) {
+        console.error('❌ Error updating cart recovery:', updateError.message);
+        return res.status(500).send('Update error');
+      }
+
+      console.log(`🎉 Cart ${cart.id} recovered! Order total: $${order.total_price}`);
+      res.status(200).send('Cart recovered');
+
+    } catch (error) {
+      console.error('❌ Unexpected error in order webhook:', error.message);
+      res.status(500).send('Server error');
+    }
+  }
+);
+
 // ─── Dashboard ───
 app.get('/dashboard', async (req, res) => {
-  const shop = req.session.shop_domain;
-
+  // First priority: session.shop_domain (set after OAuth)
+  let shop = req.session.shop_domain;
+  
+  // Second priority: req.query.shop (fallback for direct URL access)
+  if (!shop && req.query.shop) {
+    shop = shopify.utils.sanitizeShop(req.query.shop, true);
+  }
+  
+  // If neither exists, redirect to /auth with error message
   if (!shop) {
-    return res.send('No shop session');
+    return res.redirect('/auth?error=no_shop&message=No shop in session. Please authenticate again.');
   }
 
-  res.send(`Dashboard for ${shop}`);
+  try {
+    // Get shop's paid status
+    const { data: shopData, error: shopError } = await supabase
+      .from('shops')
+      .select('is_paid')
+      .eq('shop_domain', shop)
+      .single();
+
+    if (shopError) {
+      console.error('Error fetching shop data:', shopError.message);
+      return res.status(500).send('Error loading shop data');
+    }
+
+    // Get dashboard statistics
+    const { data: allCarts, error: cartsError } = await supabase
+      .from('abandoned_carts')
+      .select('*')
+      .eq('shop_domain', shop);
+
+    if (cartsError) {
+      console.error('Error fetching dashboard data:', cartsError.message);
+      return res.status(500).send('Error loading dashboard data');
+    }
+
+    // Calculate statistics
+    const totalCarts = allCarts?.length || 0;
+    const smsSent = allCarts?.filter(cart => cart.sms_sent).length || 0;
+    const secondSmsSent = allCarts?.filter(cart => cart.second_sms_sent).length || 0;
+    const recovered = allCarts?.filter(cart => cart.recovered).length || 0;
+    
+    // Calculate recovered revenue (sum of cart_total where recovered = true)
+    const recoveredRevenue = allCarts
+      ?.filter(cart => cart.recovered)
+      ?.reduce((sum, cart) => sum + (parseFloat(cart.cart_total) || 0), 0) || 0;
+
+    // Calculate potential revenue (sum of all cart_total)
+    const potentialRevenue = allCarts
+      ?.reduce((sum, cart) => sum + (parseFloat(cart.cart_total) || 0), 0) || 0;
+
+    // Calculate recovery rate
+    const recoveryRate = smsSent > 0 ? ((recovered / smsSent) * 100).toFixed(1) : '0.0';
+
+    // Get recent recovered carts
+    const recentRecovered = allCarts
+      ?.filter(cart => cart.recovered)
+      ?.sort((a, b) => new Date(b.recovered_at) - new Date(a.recovered_at))
+      ?.slice(0, 5) || [];
+
+    // Generate HTML dashboard
+    const dashboardHtml = `
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>Cart Recovery Dashboard - ${shop}</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 20px; background: #f6f6f7; }
+          .container { max-width: 1200px; margin: 0 auto; }
+          .header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+          .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; margin-bottom: 20px; }
+          .stat-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+          .stat-value { font-size: 2em; font-weight: bold; color: #059669; margin-bottom: 5px; }
+          .stat-label { color: #6b7280; font-size: 0.9em; }
+          .recovered { color: #059669; }
+          .pending { color: #d97706; }
+          .section { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+          .section h2 { margin-top: 0; color: #374151; }
+          table { width: 100%; border-collapse: collapse; }
+          th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e5e7eb; }
+          th { background: #f9fafb; font-weight: 600; color: #374151; }
+          .recovered-badge { background: #059669; color: white; padding: 4px 8px; border-radius: 4px; font-size: 0.8em; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          ${!shopData.is_paid ? `
+            <div class="unpaid-banner" style="
+              background: #dc2626;
+              color: white;
+              padding: 15px 20px;
+              border-radius: 8px;
+              margin-bottom: 20px;
+              text-align: center;
+              font-weight: 600;
+              box-shadow: 0 2px 4px rgba(220, 38, 38, 0.2);
+            ">
+              ⚠️ Your account is not active. Please contact support to activate.
+            </div>
+          ` : ''}
+          
+          <div class="header">
+            <h1>🛒 Cart Recovery Dashboard</h1>
+            <p style="color: #6b7280; margin: 5px 0;">Shop: <strong>${shop}</strong></p>
+          </div>
+
+          <div class="stats-grid">
+            <div class="stat-card">
+              <div class="stat-value">${totalCarts}</div>
+              <div class="stat-label">Total Abandoned Carts</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value">${smsSent}</div>
+              <div class="stat-label">First SMS Sent</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value">${secondSmsSent}</div>
+              <div class="stat-label">Second SMS Sent</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value recovered">${recovered}</div>
+              <div class="stat-label">Carts Recovered</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value recovered">$${recoveredRevenue.toFixed(2)}</div>
+              <div class="stat-label">TOTAL REVENUE RECOVERED</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-value">${recoveryRate}%</div>
+              <div class="stat-label">Recovery Rate</div>
+            </div>
+          </div>
+
+          <div class="section">
+            <h2>🎉 Recent Recoveries</h2>
+            ${recentRecovered.length > 0 ? `
+              <table>
+                <thead>
+                  <tr>
+                    <th>Customer</th>
+                    <th>Products</th>
+                    <th>Cart Total</th>
+                    <th>Recovered At</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${recentRecovered.map(cart => `
+                    <tr>
+                      <td>${cart.customer_name || 'Unknown'}</td>
+                      <td>${cart.product_names || 'N/A'}</td>
+                      <td>$${parseFloat(cart.cart_total || 0).toFixed(2)}</td>
+                      <td>${new Date(cart.recovered_at).toLocaleString()}</td>
+                      <td><span class="recovered-badge">Recovered</span></td>
+                    </tr>
+                  `).join('')}
+                </tbody>
+              </table>
+            ` : '<p style="color: #6b7280;">No recovered carts yet.</p>'}
+          </div>
+
+          <div class="section">
+            <h2>📊 Summary</h2>
+            <p><strong>Potential Revenue:</strong> $${potentialRevenue.toFixed(2)}</p>
+            <p><strong>Recovered Revenue:</strong> $${recoveredRevenue.toFixed(2)} (${((recoveredRevenue / potentialRevenue) * 100).toFixed(1)}% of potential)</p>
+            <p><strong>Recovery Rate:</strong> ${recoveryRate}% of customers who received SMS</p>
+          </div>
+        </div>
+      </body>
+      </html>
+    `;
+
+    res.send(dashboardHtml);
+
+  } catch (error) {
+    console.error('Dashboard error:', error.message);
+    res.status(500).send('Error loading dashboard');
+  }
 });
 
 // ─── START SERVER (ONLY ONE) ───
