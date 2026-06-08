@@ -6,13 +6,28 @@ const shopify = require('./shopify');
 const supabase = require('./supabase');
 const { startScheduler } = require('./sms-scheduler');
 
+if (!process.env.SESSION_SECRET) {
+  throw new Error('SESSION_SECRET environment variable is required. Set it in .env before starting the server.');
+}
+
+// ─── HTML escape to prevent XSS in dashboard templates ───
+function escapeHtml(str) {
+  if (str == null) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(
   session({
     name: 'shopify_plugin_sid',
-    secret: process.env.SESSION_SECRET || 'dev-session-secret-change-me',
+    secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -130,7 +145,7 @@ app.get('/auth/callback', async (req, res) => {
           webhook: {
             topic: 'carts/update',
             address:
-              'https://shopify-cart-recovery-sms.onrender.com/webhooks/carts/update',
+              `${process.env.HOST}/webhooks/carts/update`,
             format: 'json',
           },
         }),
@@ -147,7 +162,7 @@ app.get('/auth/callback', async (req, res) => {
           webhook: {
             topic: 'orders/create',
             address:
-              'https://shopify-cart-recovery-sms.onrender.com/webhooks/orders/create',
+              `${process.env.HOST}/webhooks/orders/create`,
             format: 'json',
           },
         }),
@@ -164,7 +179,7 @@ app.get('/auth/callback', async (req, res) => {
           webhook: {
             topic: 'app/uninstalled',
             address:
-              'https://shopify-cart-recovery-sms.onrender.com/webhooks/app/uninstalled',
+              `${process.env.HOST}/webhooks/app/uninstalled`,
             format: 'json',
           },
         }),
@@ -187,7 +202,7 @@ app.get('/auth/callback', async (req, res) => {
           body: JSON.stringify({
             webhook: {
               topic,
-              address: `https://shopify-cart-recovery-sms.onrender.com${path}`,
+              address: `${process.env.HOST}${path}`,
               format: 'json',
             },
           }),
@@ -197,6 +212,67 @@ app.get('/auth/callback', async (req, res) => {
       console.log('✅ Webhooks registered (carts/update, orders/create, app/uninstalled, GDPR x3)');
     } catch (err) {
       console.error('Webhook error:', err.message);
+    }
+
+    // 🏷️ AUTO-CREATE COMEBACK10 DISCOUNT CODE
+    try {
+      // Step 1: Create a price rule (10% off entire order)
+      const priceRuleRes = await fetch(`https://${shop}/admin/api/2024-01/price_rules.json`, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': accessToken,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          price_rule: {
+            title: 'COMEBACK10',
+            target_type: 'line_item',
+            target_selection: 'all',
+            allocation_method: 'across',
+            value_type: 'percentage',
+            value: '-10.0',
+            customer_selection: 'all',
+            starts_at: new Date().toISOString(),
+            usage_limit: null,
+            once_per_customer: true,
+          },
+        }),
+      });
+
+      const priceRuleData = await priceRuleRes.json();
+
+      if (priceRuleData.price_rule) {
+        // Step 2: Create a discount code linked to the price rule
+        const priceRuleId = priceRuleData.price_rule.id;
+
+        await fetch(`https://${shop}/admin/api/2024-01/price_rules/${priceRuleId}/discount_codes.json`, {
+          method: 'POST',
+          headers: {
+            'X-Shopify-Access-Token': accessToken,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            discount_code: { code: 'COMEBACK10' },
+          }),
+        });
+
+        // Mark discount as created in shops table
+        await supabase
+          .from('shops')
+          .update({ discount_code_created: true })
+          .eq('shop_domain', shop);
+
+        console.log('✅ Discount code COMEBACK10 created');
+      } else if (priceRuleData.errors) {
+        // Code likely already exists — mark as created anyway
+        console.log('ℹ️ Discount code may already exist:', JSON.stringify(priceRuleData.errors));
+        await supabase
+          .from('shops')
+          .update({ discount_code_created: true })
+          .eq('shop_domain', shop);
+      }
+    } catch (err) {
+      console.error('Discount code creation error:', err.message);
     }
 
     res.redirect('/dashboard');
@@ -216,11 +292,14 @@ app.post(
     const phone = cart.phone || cart.customer?.phone;
     if (!phone) return res.status(200).send('No phone');
 
+    const customerName = cart.customer?.first_name || null;
+
     await supabase.from('abandoned_carts').upsert(
       {
         shop_domain: shopDomain,
         cart_token: cart.token,
         customer_phone: phone,
+        customer_name: customerName,
         cart_total: cart.total_price,
         product_names: (cart.line_items || [])
           .map((i) => i.title)
@@ -484,7 +563,7 @@ app.get('/dashboard', async (req, res) => {
       <!DOCTYPE html>
       <html>
       <head>
-        <title>Cart Recovery Dashboard - ${shop}</title>
+        <title>Cart Recovery Dashboard - ${escapeHtml(shop)}</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -524,7 +603,7 @@ app.get('/dashboard', async (req, res) => {
           
           <div class="header">
             <h1>🛒 Cart Recovery Dashboard</h1>
-            <p style="color: #6b7280; margin: 5px 0;">Shop: <strong>${shop}</strong></p>
+            <p style="color: #6b7280; margin: 5px 0;">Shop: <strong>${escapeHtml(shop)}</strong></p>
           </div>
 
           <div class="stats-grid">
@@ -570,10 +649,10 @@ app.get('/dashboard', async (req, res) => {
                 <tbody>
                   ${recentRecovered.map(cart => `
                     <tr>
-                      <td>${cart.customer_name || 'Unknown'}</td>
-                      <td>${cart.product_names || 'N/A'}</td>
+                      <td>${escapeHtml(cart.customer_name || 'Unknown')}</td>
+                      <td>${escapeHtml(cart.product_names || 'N/A')}</td>
                       <td>$${parseFloat(cart.cart_total || 0).toFixed(2)}</td>
-                      <td>${new Date(cart.recovered_at).toLocaleString()}</td>
+                      <td>${escapeHtml(new Date(cart.recovered_at).toLocaleString())}</td>
                       <td><span class="recovered-badge">Recovered</span></td>
                     </tr>
                   `).join('')}
@@ -604,9 +683,7 @@ app.get('/dashboard', async (req, res) => {
 // ─── START SERVER (ONLY ONE) ───
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(
-    `Live URL: https://shopify-cart-recovery-sms.onrender.com`
-  );
+  console.log(`Live URL: ${process.env.HOST}`);
 
   startScheduler();
 });
