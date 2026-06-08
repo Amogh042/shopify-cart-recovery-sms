@@ -11,6 +11,13 @@ const TWILIO_PHONE = process.env.TWILIO_PHONE_NUMBER;
 
 let isRunning = false;
 
+// E.164 format: + followed by 1-15 digits
+const E164_REGEX = /^\+[1-9]\d{1,14}$/;
+
+function isValidE164(phone) {
+  return E164_REGEX.test(phone);
+}
+
 /**
  * Process first SMS (after 1 hour)
  */
@@ -187,6 +194,11 @@ async function sendAbandonedCartSMS() {
           await supabase.from('abandoned_carts').update({ sms_sent: true }).eq('id', cart.id);
           continue;
         }
+        if (!isValidE164(cart.customer_phone)) {
+          console.log(`   ⚠️  Invalid phone format "${cart.customer_phone}" — skipping cart ${cart.id}`);
+          await supabase.from('abandoned_carts').update({ sms_sent: true }).eq('id', cart.id);
+          continue;
+        }
         await processFirstSMS(cart);
       }
     }
@@ -221,6 +233,10 @@ async function sendAbandonedCartSMS() {
         }
         if (optedOutPhones.has(cart.customer_phone)) {
           console.log(`   🚫 Opted-out phone ${cart.customer_phone} — skipping cart ${cart.id}`);
+          continue;
+        }
+        if (!isValidE164(cart.customer_phone)) {
+          console.log(`   ⚠️  Invalid phone format "${cart.customer_phone}" — skipping cart ${cart.id}`);
           continue;
         }
         await processSecondSMS(cart);

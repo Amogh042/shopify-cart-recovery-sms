@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
+const rateLimit = require('express-rate-limit');
 const crypto = require('crypto');
 const shopify = require('./shopify');
 const supabase = require('./supabase');
@@ -48,6 +49,21 @@ app.use((req, res, next) => {
   } else {
     next();
   }
+});
+
+// ─── Rate limiting for webhook endpoints ───
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' },
+});
+app.use('/webhooks', webhookLimiter);
+
+// ─── Health check ───
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok' });
 });
 
 // ─── HMAC Verification ───
